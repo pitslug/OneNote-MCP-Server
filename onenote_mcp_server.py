@@ -1056,24 +1056,38 @@ async def create_page(section_id: str, title: str, content_html: str = None) -> 
     return await _create_page_impl(section_id, title, content_html)
 
 @mcp.tool()
-async def update_page_content(page_id: str, content_html: str, target_element: str = "body") -> str:
+async def update_page_content(page_id: str, content_html: str, target_element: str = "body",
+                              action: str = "append") -> str:
     """
     Update the content of an existing OneNote page.
 
     Args:
         page_id: ID of the page to update
         content_html: New HTML content to add/replace
-        target_element: Target element to update (default: "body")
+        target_element: Target element to update (default: "body"). Use "title"
+            with the new title text as content_html to rename a page.
+        action: How to apply the content: "append" (default), "replace",
+            "prepend", or "insert". The "title" target only supports replace,
+            so replace is used automatically there.
 
     Returns:
         Status message
     """
     try:
+        valid_actions = ("append", "replace", "prepend", "insert")
+        if action not in valid_actions:
+            return (f"Error updating page content: unsupported action '{action}' "
+                    f"(use one of: {', '.join(valid_actions)})")
+        # Graph rejects APPEND on the title target (error 20141); replace is the
+        # only action that works for titles.
+        if target_element == "title" and action == "append":
+            action = "replace"
+
         # OneNote PATCH API for updating page content
         patch_data = [
             {
                 "target": target_element,
-                "action": "append",
+                "action": action,
                 "content": content_html
             }
         ]
@@ -1115,6 +1129,10 @@ async def update_page_content(page_id: str, content_html: str, target_element: s
 COPY_WAIT_SECONDS = float(os.getenv("ONENOTE_COPY_WAIT", "60"))
 OPERATION_POLL_INTERVAL = 2.0
 
+class GraphUnsupportedError(Exception):
+    """Graph answered 501 'not implemented' - the operation doesn't exist for
+    this notebook type (consumer/personal OneDrive notebooks lack copyToSection)."""
+
 async def _start_page_copy(page_id: str, target_section_id: str) -> str:
     """Kick off a copyToSection and return the operation id to poll."""
     response = await _graph_request_raw(
@@ -1122,6 +1140,12 @@ async def _start_page_copy(page_id: str, target_section_id: str) -> str:
         f"/me/onenote/pages/{page_id}/copyToSection",
         json_data={"id": target_section_id},
     )
+    if response.status_code == 501:
+        raise GraphUnsupportedError(
+            "Microsoft Graph does not support page copy/move for personal OneDrive "
+            "notebooks (error 20111, 'OData Feature not implemented'). Move or copy "
+            "the page manually in the OneNote app."
+        )
     if response.status_code >= 400:
         raise Exception(f"Graph API error: {response.status_code} - {response.text}")
 
@@ -1223,6 +1247,11 @@ async def copy_page(page_id: str, target_section_id: str) -> str:
             ),
         }, indent=2)
 
+    except GraphUnsupportedError as e:
+        return json.dumps({
+            "status": "unsupported",
+            "error": str(e),
+        }, indent=2)
     except Exception as e:
         return f"Error copying page: {str(e)}"
 
@@ -1287,6 +1316,12 @@ async def move_page(page_id: str, target_section_id: str) -> str:
             "new_page_url": op.get("resourceLocation"),
         }, indent=2)
 
+    except GraphUnsupportedError as e:
+        return json.dumps({
+            "status": "unsupported",
+            "error": str(e),
+            "hint": "The original page was not modified or deleted.",
+        }, indent=2)
     except Exception as e:
         return f"Error moving page: {str(e)}"
 
