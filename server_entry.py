@@ -31,6 +31,15 @@ from secrets_env import load_file_backed_env
 logging.basicConfig(level=os.getenv("ONENOTE_LOG_LEVEL", "INFO").upper())
 logger = logging.getLogger("onenote.entry")
 
+# Cosmetic: silence a deprecation from a transitive dep we don't drive ---
+# fastmcp imports authlib.jose (upstream will move to joserfc); we never call it.
+import warnings
+try:
+    from authlib.deprecate import AuthlibDeprecationWarning
+    warnings.filterwarnings("ignore", category=AuthlibDeprecationWarning)
+except Exception:  # authlib absent or relocated — leave default warnings behavior
+    pass
+
 # 1) Secrets must resolve before onenote_mcp_server reads AZURE_CLIENT_ID etc.
 load_file_backed_env()
 
@@ -220,7 +229,8 @@ def run_http() -> int:
     _log_auth_status()
     logger.info("Serving MCP over streamable-HTTP on %s:%s (path %s)",
                 host, port, os.getenv("ONENOTE_HTTP_PATH", "/mcp"))
-    uvicorn.run(app, host=host, port=port, log_level=os.getenv("ONENOTE_LOG_LEVEL", "info").lower())
+    uvicorn.run(app, host=host, port=port, ws="none",
+                log_level=os.getenv("ONENOTE_LOG_LEVEL", "info").lower())
     return 0
 
 

@@ -92,14 +92,14 @@ After the first successful run, open the package in GitHub and set its visibilit
 **public** (so pulls need no auth — the "open for all" goal).
 
 ### 3. Switch compose to pull
-In `docker-compose.yml` set `image: ghcr.io/<you>/onenote-mcp-server:v1`, comment out
+In `docker-compose.yml` set `image: ghcr.io/<you>/onenote-mcp-server:1`, comment out
 `build:`, then:
 ```bash
 docker compose pull && docker compose up -d
 ```
 
 ### 4. Auto-update (optional)
-Point Watchtower at it, or use Unraid's "check for updates". Floating `:v1` picks up
+Point Watchtower at it, or use Unraid's "check for updates". Floating `:1` picks up
 patch/minor releases automatically; pin `:1.0.0` if you'd rather bump by hand.
 
 ---

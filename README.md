@@ -47,7 +47,7 @@ See **[DEPLOY.md](./DEPLOY.md)** for the full walkthrough. In short:
 5. Add a Claude custom connector at `https://<your-host>/mcp` with header
    `Authorization: Bearer <your token>`.
 
-Or pull the published image: `ghcr.io/pitslug/onenote-mcp-server:v1`.
+Or pull the published image: `ghcr.io/pitslug/onenote-mcp-server:1`.
 
 ## Auth model (two independent layers)
 

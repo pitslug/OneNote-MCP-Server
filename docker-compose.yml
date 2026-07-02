@@ -2,9 +2,9 @@
 # Copy to your stack, fill in the placeholders, drop your secrets into ./secrets/.
 services:
   onenote-mcp:
-    # Pull the published image (float :v1 for auto patch/minor updates), OR
+    # Pull the published image (float :1 for auto patch/minor updates), OR
     # comment `image:` and uncomment `build:` to build locally from this folder.
-    image: ghcr.io/pitslug/onenote-mcp-server:v1
+    image: ghcr.io/pitslug/onenote-mcp-server:1
     # build: .
     container_name: onenote-mcp
     restart: unless-stopped
