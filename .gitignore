@@ -38,9 +38,9 @@ Thumbs.db
 *.log
 logs/
 
-# Test files
-test_*.py
-*_test.py
+# Local scratch test scripts at repo root (the real suite lives in tests/)
+/test_*.py
+/*_test.py
 
 # Temporary files
 tmp/

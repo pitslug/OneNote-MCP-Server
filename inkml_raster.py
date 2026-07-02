@@ -16,6 +16,12 @@ from PIL import Image, ImageDraw
 
 Point = Tuple[float, float]
 
+# Safety clamp for the caller-supplied max_px: the value arrives from the model via
+# the render_page_ink tool, so an absurd request must not allocate a giant canvas
+# (max_px * supersample is the working edge before downscaling).
+MIN_RENDER_PX = 256
+MAX_RENDER_PX = 4000
+
 _TRACE_RE = re.compile(r"<(?:inkml:)?trace\b[^>]*>(.*?)</(?:inkml:)?trace>", re.DOTALL)
 _CHANNEL_RE = re.compile(r'<(?:inkml:)?channel\b[^>]*\bname="([^"]+)"', re.IGNORECASE)
 _BRUSH_COLOR_RE = re.compile(r'brushProperty\b[^>]*\bname="color"[^>]*\bvalue="(#[0-9A-Fa-f]{6})"')
@@ -66,7 +72,13 @@ def rasterize_inkml(
     grayscale: bool = True,
     max_bytes: int = 900_000,
 ) -> bytes:
-    """Render InkML to PNG bytes (<= max_bytes). Raises ValueError if there are no strokes."""
+    """Render InkML to PNG bytes (<= max_bytes). Raises ValueError if there are no strokes.
+
+    Note: brush color/width are taken from the first brush definition and applied to
+    every stroke, so multi-pen pages render in a single color (fine for the grayscale
+    output vision reads; per-stroke brushes would need real XML parsing).
+    """
+    max_px = max(MIN_RENDER_PX, min(int(max_px), MAX_RENDER_PX))
     traces = parse_traces(inkml)
     if not traces:
         raise ValueError("no ink traces to rasterize")

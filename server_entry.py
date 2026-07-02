@@ -112,6 +112,11 @@ class Gateway:
         self._app = app
         self._token = token or None
         self._auth_route = auth_route
+        # Single-flight guard for /auth: each pending device flow parks a worker
+        # thread for up to ~15 min, so unauthenticated hits must not stack them up.
+        self._auth_pending = False
+        # Strong refs to background completion tasks (asyncio only weakly refs tasks).
+        self._auth_tasks: set = set()
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
@@ -156,23 +161,39 @@ class Gateway:
             await self._text(send, 200, "Already authenticated. The server is ready.")
             return
 
+        if self._auth_pending:
+            await self._text(send, 200, "A sign-in is already in progress. Complete it "
+                                        "on the device, or retry once it expires.")
+            return
+
+        # Claim the slot BEFORE the initiate network round-trip: a concurrent burst
+        # arriving during that await must not each start (and park) a device flow.
+        # Released by _complete's finally once scheduled, or the failure paths below.
+        self._auth_pending = True
+        scheduled = False
         try:
             app = srv.get_msal_app()
-            flow = app.initiate_device_flow(scopes=srv.SCOPES)
+            flow = await asyncio.to_thread(app.initiate_device_flow, scopes=srv.SCOPES)
             if "user_code" not in flow:
+                self._auth_pending = False
                 await self._text(send, 500, "Could not start device flow.")
                 return
 
             async def _complete():
-                loop = asyncio.get_event_loop()
-                result = await loop.run_in_executor(None, app.acquire_token_by_device_flow, flow)
-                if "access_token" in result:
-                    srv._persist_cache()
-                    logger.info("/auth: device sign-in completed and cache persisted")
-                else:
-                    logger.warning("/auth: device sign-in failed: %s", result.get("error_description"))
+                try:
+                    result = await asyncio.to_thread(app.acquire_token_by_device_flow, flow)
+                    if "access_token" in result:
+                        srv._persist_cache()
+                        logger.info("/auth: device sign-in completed and cache persisted")
+                    else:
+                        logger.warning("/auth: device sign-in failed: %s", result.get("error_description"))
+                finally:
+                    self._auth_pending = False
 
-            asyncio.ensure_future(_complete())
+            task = asyncio.ensure_future(_complete())
+            scheduled = True
+            self._auth_tasks.add(task)
+            task.add_done_callback(self._auth_tasks.discard)
             msg = (
                 f"Go to {flow['verification_uri']} and enter code: {flow['user_code']}\n\n"
                 "This page started the sign-in; complete it on that device. "
@@ -180,6 +201,8 @@ class Gateway:
             )
             await self._text(send, 200, msg)
         except Exception as exc:  # noqa: BLE001
+            if not scheduled:  # once _complete owns the slot, its finally releases it
+                self._auth_pending = False
             await self._text(send, 500, f"Auth error: {exc}")
 
     @staticmethod

@@ -7,6 +7,7 @@ __pycache__
 *.py[cod]
 
 # Tests & scratch
+tests/
 test_*.py
 *_test.py
 dump_ink.py

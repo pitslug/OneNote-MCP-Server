@@ -12,19 +12,17 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# uv for fast, reproducible installs. Deps layer first for build caching.
+# uv for fast, reproducible installs — resolved from the committed lockfile so the
+# image gets exactly the versions that were tested. Deps layer first for caching.
 RUN pip install --no-cache-dir uv
-RUN uv pip install --system --no-cache \
-    "mcp>=1.2.0" \
-    "fastmcp>=2.8,<3" \
-    "msal>=1.25.0" \
-    "httpx>=0.25.0" \
-    "pillow>=10.0.0" \
-    "uvicorn>=0.30"
+COPY pyproject.toml uv.lock ./
+RUN uv export --frozen --no-dev --no-emit-project -o /tmp/requirements.txt \
+    && uv pip install --system --no-cache -r /tmp/requirements.txt \
+    && rm /tmp/requirements.txt
 
 # Application modules only (no tests, no local configs — see .dockerignore).
 COPY onenote_mcp_server.py server_entry.py secrets_env.py inkml_raster.py notebook_cache.py ./
-COPY pyproject.toml LICENSE ./
+COPY LICENSE ./
 
 # Non-root, own the data volumes.
 RUN useradd --system --uid 10001 --create-home app \
