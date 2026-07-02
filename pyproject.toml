@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "onenote-mcp-server"
-version = "1.0.3"
+version = "1.0.5"
 description = "OneNote MCP Sidekick - read handwritten ink, summarize, write back typed pages"
 authors = [
     {name = "Chris Pitman"}
