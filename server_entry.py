@@ -252,7 +252,12 @@ def run_http() -> int:
     _log_auth_status()
     logger.info("Serving MCP over streamable-HTTP on %s:%s (path %s)",
                 host, port, os.getenv("ONENOTE_HTTP_PATH", "/mcp"))
+    # proxy_headers + forwarded_allow_ips: trust Traefik's X-Forwarded-Proto so
+    # trailing-slash redirects (/mcp -> /mcp/) stay https instead of downgrading to
+    # http. An http downgrade makes clients drop the Authorization header (401).
     uvicorn.run(app, host=host, port=port, ws="none",
+                proxy_headers=True,
+                forwarded_allow_ips=os.getenv("ONENOTE_FORWARDED_IPS", "*"),
                 log_level=os.getenv("ONENOTE_LOG_LEVEL", "info").lower())
     return 0
 
