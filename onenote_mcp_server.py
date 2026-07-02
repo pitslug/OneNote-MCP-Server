@@ -383,6 +383,8 @@ async def make_graph_request(endpoint: str, method: str = "GET", data: Dict = No
                 response = await client.post(url, headers=headers, json=data)
             elif method == "PATCH":
                 response = await client.patch(url, headers=headers, json=data)
+            elif method == "DELETE":
+                response = await client.delete(url, headers=headers)
             else:
                 raise ValueError(f"Unsupported HTTP method: {method}")
         except httpx.TransportError as e:
@@ -401,6 +403,9 @@ async def make_graph_request(endpoint: str, method: str = "GET", data: Dict = No
         if response.status_code >= 400:
             raise Exception(f"Graph API error: {response.status_code} - {response.text}")
 
+        # DELETE (204) and some accepted requests return no body.
+        if not response.content:
+            return {}
         return response.json()
 
     raise Exception(f"Graph API error after {MAX_RETRIES} attempts on {endpoint} - {last_error or 'transient failures'}")
@@ -434,9 +439,10 @@ async def _graph_get_all(endpoint: str, max_pages: int = 50) -> List[Dict]:
         logger.warning(f"_graph_get_all: hit {max_pages}-page cap on {endpoint}; result truncated")
     return items
 
-async def _graph_get_raw(path: str, params: Dict = None) -> "httpx.Response":
-    """Raw Graph GET returning the untouched httpx.Response (for multipart/HTML page
-    bodies), with the same transient-retry behavior as make_graph_request."""
+async def _graph_request_raw(method: str, path: str, params: Dict = None, json_data: Dict = None) -> "httpx.Response":
+    """Raw Graph request returning the untouched httpx.Response (for multipart/HTML
+    bodies or callers that need response headers, e.g. Operation-Location), with the
+    same transient-retry behavior as make_graph_request."""
     token = await get_access_token()
     url = f"{GRAPH_BASE_URL}{path}"
     headers = {"Authorization": f"Bearer {token}"}
@@ -445,13 +451,13 @@ async def _graph_get_raw(path: str, params: Dict = None) -> "httpx.Response":
     response = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            response = await _http_client().get(url, headers=headers, params=params)
+            response = await _http_client().request(method, url, headers=headers, params=params, json=json_data)
         except httpx.TransportError as e:
             last_error = f"network error: {e}"
             if attempt < MAX_RETRIES:
                 await asyncio.sleep(_backoff_seconds(attempt))
                 continue
-            raise Exception(f"Graph GET failed after {attempt} attempts - {last_error}")
+            raise Exception(f"Graph {method} failed after {attempt} attempts - {last_error}")
 
         if response.status_code in RETRY_STATUSES and attempt < MAX_RETRIES:
             delay = _retry_after_seconds(response) or _backoff_seconds(attempt)
@@ -462,6 +468,10 @@ async def _graph_get_raw(path: str, params: Dict = None) -> "httpx.Response":
         return response
 
     return response
+
+async def _graph_get_raw(path: str, params: Dict = None) -> "httpx.Response":
+    """Raw Graph GET (see _graph_request_raw)."""
+    return await _graph_request_raw("GET", path, params=params)
 
 INK_REVALIDATE = float(os.getenv("ONENOTE_INK_REVALIDATE", "30"))
 
@@ -793,12 +803,15 @@ async def create_notebook(name: str, description: str = None) -> str:
 @mcp.tool()
 async def create_section(notebook_id: str, name: str) -> str:
     """
-    Create a new section in a OneNote notebook.
-    
+    Create a new section at the top level of a OneNote notebook.
+
+    To create a section inside a section group (e.g. "Clients > Harmony"),
+    use create_section_in_group instead.
+
     Args:
         notebook_id: ID of the notebook to create the section in
         name: Name of the new section
-    
+
     Returns:
         JSON string with the created section information
     """
@@ -822,9 +835,128 @@ async def create_section(notebook_id: str, name: str) -> str:
         }
         
         return json.dumps(result, indent=2)
-    
+
     except Exception as e:
         return f"Error creating section: {str(e)}"
+
+def _section_group_summary(group: Dict) -> Dict:
+    """Trim a Graph sectionGroup resource to the fields tools return."""
+    return {
+        "id": group.get("id"),
+        "name": group.get("displayName"),
+        "created": group.get("createdDateTime"),
+        "modified": group.get("lastModifiedDateTime"),
+        "sections": [
+            {"id": s.get("id"), "name": s.get("displayName")}
+            for s in group.get("sections", [])
+        ],
+    }
+
+@mcp.tool()
+async def list_section_groups(notebook_id: str = None, section_group_id: str = None) -> str:
+    """
+    List section groups, including the sections inside each group.
+
+    Section groups are folders that nest sections (and other section groups)
+    inside a notebook, e.g. "Clients > Harmony". Sections inside a group do NOT
+    appear in list_sections, so use this to discover nested structure.
+
+    Args:
+        notebook_id: List section groups directly under this notebook.
+        section_group_id: List section groups nested inside this section group.
+            If neither argument is given, lists all section groups across notebooks.
+
+    Returns:
+        JSON string containing section group information with nested sections
+    """
+    try:
+        if section_group_id:
+            endpoint = f"/me/onenote/sectionGroups/{section_group_id}/sectionGroups"
+        elif notebook_id:
+            endpoint = f"/me/onenote/notebooks/{notebook_id}/sectionGroups"
+        else:
+            endpoint = "/me/onenote/sectionGroups"
+
+        groups = await _graph_get_all(f"{endpoint}?$expand=sections")
+        result = [_section_group_summary(g) for g in groups]
+        return json.dumps(result, indent=2)
+
+    except Exception as e:
+        return f"Error listing section groups: {str(e)}"
+
+@mcp.tool()
+async def create_section_group(notebook_id: str, name: str) -> str:
+    """
+    Create a new section group in a OneNote notebook.
+
+    Section groups act as folders for sections. After creating one, add
+    sections inside it with create_section_in_group.
+
+    Args:
+        notebook_id: ID of the notebook to create the section group in
+        name: Name of the new section group
+
+    Returns:
+        JSON string with the created section group information
+    """
+    try:
+        group = await make_graph_request(
+            f"/me/onenote/notebooks/{notebook_id}/sectionGroups",
+            method="POST",
+            data={"displayName": name},
+        )
+
+        result = {
+            "status": "success",
+            "message": f"Section group '{name}' created successfully",
+            "section_group": {
+                "id": group.get("id"),
+                "name": group.get("displayName"),
+                "created": group.get("createdDateTime"),
+            },
+        }
+
+        return json.dumps(result, indent=2)
+
+    except Exception as e:
+        return f"Error creating section group: {str(e)}"
+
+@mcp.tool()
+async def create_section_in_group(section_group_id: str, name: str) -> str:
+    """
+    Create a new section inside a section group.
+
+    Use this for nested structures like "Clients > Harmony": create (or find)
+    the "Clients" section group, then create the "Harmony" section inside it.
+
+    Args:
+        section_group_id: ID of the section group to create the section in
+        name: Name of the new section
+
+    Returns:
+        JSON string with the created section information
+    """
+    try:
+        section = await make_graph_request(
+            f"/me/onenote/sectionGroups/{section_group_id}/sections",
+            method="POST",
+            data={"displayName": name},
+        )
+
+        result = {
+            "status": "success",
+            "message": f"Section '{name}' created successfully in section group",
+            "section": {
+                "id": section.get("id"),
+                "name": section.get("displayName"),
+                "created": section.get("createdDateTime"),
+            },
+        }
+
+        return json.dumps(result, indent=2)
+
+    except Exception as e:
+        return f"Error creating section in section group: {str(e)}"
 
 async def _create_page_impl(section_id: str, title: str, content_html: str = None) -> str:
     """Create a new typed page in a section. Shared by the create_page tool and the
@@ -977,6 +1109,264 @@ async def update_page_content(page_id: str, content_html: str, target_element: s
 
     except Exception as e:
         return f"Error updating page content: {str(e)}"
+
+# Page copy is asynchronous in Graph (202 + Operation-Location): poll the operation
+# up to this long before handing the operation id back to the caller.
+COPY_WAIT_SECONDS = float(os.getenv("ONENOTE_COPY_WAIT", "60"))
+OPERATION_POLL_INTERVAL = 2.0
+
+async def _start_page_copy(page_id: str, target_section_id: str) -> str:
+    """Kick off a copyToSection and return the operation id to poll."""
+    response = await _graph_request_raw(
+        "POST",
+        f"/me/onenote/pages/{page_id}/copyToSection",
+        json_data={"id": target_section_id},
+    )
+    if response.status_code >= 400:
+        raise Exception(f"Graph API error: {response.status_code} - {response.text}")
+
+    # The operation id is the tail of the Operation-Location header; some responses
+    # also (or only) carry it in the body.
+    op_location = response.headers.get("Operation-Location", "")
+    op_id = op_location.rstrip("/").rsplit("/", 1)[-1] if op_location else ""
+    if not op_id:
+        try:
+            op_id = response.json().get("id") or ""
+        except Exception:
+            pass
+    if not op_id:
+        raise Exception("copyToSection was accepted but Graph returned no operation id")
+    return op_id
+
+async def _poll_operation(operation_id: str, wait_seconds: float) -> Dict:
+    """Poll a OneNote async operation until it finishes or the wait budget runs out.
+    Returns the last operation resource seen (status may still be running)."""
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        op = await make_graph_request(f"/me/onenote/operations/{operation_id}")
+        status = (op.get("status") or "").lower()
+        if status in ("completed", "failed") or time.monotonic() >= deadline:
+            return op
+        await asyncio.sleep(OPERATION_POLL_INTERVAL)
+
+async def _ink_guard(page_id: str, action: str) -> Optional[str]:
+    """Return a refusal message if the page contains ink or its ink status can't be
+    verified, else None. The server's hard rule is to never destroy handwritten ink,
+    so this fails closed: no verification, no deletion."""
+    try:
+        response = await _graph_get_raw(
+            f"/me/onenote/pages/{page_id}/content",
+            params={"includeInkML": "true"},
+        )
+        if response.status_code >= 400:
+            return (
+                f"Could not verify the page is ink-free "
+                f"({response.status_code} - {response.text[:200]}); refusing to {action}."
+            )
+        parsed = _parse_page_multipart(
+            response.headers.get("content-type", ""), response.content
+        )
+        if parsed["has_ink"]:
+            return (
+                f"Page contains handwritten ink ({parsed['trace_count']} strokes). "
+                f"This server never deletes ink pages; refusing to {action}."
+            )
+        return None
+    except Exception as e:
+        return f"Could not verify the page is ink-free ({e}); refusing to {action}."
+
+@mcp.tool()
+async def copy_page(page_id: str, target_section_id: str) -> str:
+    """Copy a page into another section. The original page is left untouched, so
+    this is safe for any page, including ink pages.
+
+    Graph performs the copy asynchronously; this polls until it finishes (up to
+    ONENOTE_COPY_WAIT seconds, default 60). If it is still running after that,
+    the operation id is returned - pass it to check_onenote_operation to get the
+    new page id once the copy completes.
+
+    Args:
+        page_id: ID of the page to copy.
+        target_section_id: ID of the section to copy the page into.
+
+    Returns:
+        JSON with the new page id (or a pending operation id).
+    """
+    try:
+        op_id = await _start_page_copy(page_id, target_section_id)
+        op = await _poll_operation(op_id, COPY_WAIT_SECONDS)
+        status = (op.get("status") or "").lower()
+
+        if status == "completed":
+            CACHE.invalidate_listings()  # new page -> drop stale listing caches
+            return json.dumps({
+                "status": "success",
+                "message": "Page copied successfully",
+                "new_page_id": op.get("resourceId"),
+                "new_page_url": op.get("resourceLocation"),
+            }, indent=2)
+
+        if status == "failed":
+            error = op.get("error") or {}
+            return json.dumps({
+                "status": "error",
+                "error": f"Copy failed: {error.get('message', 'unknown error')}",
+                "operation_id": op_id,
+            }, indent=2)
+
+        return json.dumps({
+            "status": "pending",
+            "operation_id": op_id,
+            "message": (
+                f"Copy still running after {COPY_WAIT_SECONDS:.0f}s. "
+                "Call check_onenote_operation with this operation_id for the result."
+            ),
+        }, indent=2)
+
+    except Exception as e:
+        return f"Error copying page: {str(e)}"
+
+@mcp.tool()
+async def move_page(page_id: str, target_section_id: str) -> str:
+    """Move a typed page to another section (copy, then delete the original once
+    the copy has completed).
+
+    REFUSES to move pages containing handwritten ink - the delete half would
+    destroy the original ink, and this server never touches ink pages. For ink
+    pages use copy_page, which leaves the original in place.
+
+    Args:
+        page_id: ID of the page to move.
+        target_section_id: ID of the destination section.
+
+    Returns:
+        JSON with the new page id, or a refusal/pending status.
+    """
+    try:
+        guard = await _ink_guard(page_id, "move it (the original would be deleted)")
+        if guard:
+            return json.dumps({
+                "status": "refused",
+                "error": guard,
+                "hint": "Use copy_page instead; it leaves the original page untouched.",
+            }, indent=2)
+
+        op_id = await _start_page_copy(page_id, target_section_id)
+        op = await _poll_operation(op_id, COPY_WAIT_SECONDS)
+        status = (op.get("status") or "").lower()
+
+        if status == "failed":
+            error = op.get("error") or {}
+            return json.dumps({
+                "status": "error",
+                "error": f"Copy failed: {error.get('message', 'unknown error')} - original page NOT deleted",
+                "operation_id": op_id,
+            }, indent=2)
+
+        if status != "completed":
+            return json.dumps({
+                "status": "pending",
+                "operation_id": op_id,
+                "message": (
+                    f"Copy still running after {COPY_WAIT_SECONDS:.0f}s; the original was NOT "
+                    "deleted. Call check_onenote_operation with this operation_id, then "
+                    "delete_page on the original once the copy has completed."
+                ),
+            }, indent=2)
+
+        # Copy confirmed complete - now remove the original.
+        await make_graph_request(f"/me/onenote/pages/{page_id}", method="DELETE")
+        # invalidate_page walks/removes files - keep it off the event loop.
+        await asyncio.to_thread(CACHE.invalidate_page, page_id)
+        CACHE.invalidate_listings()
+
+        return json.dumps({
+            "status": "success",
+            "message": "Page moved successfully (copied to target section, original deleted)",
+            "new_page_id": op.get("resourceId"),
+            "new_page_url": op.get("resourceLocation"),
+        }, indent=2)
+
+    except Exception as e:
+        return f"Error moving page: {str(e)}"
+
+@mcp.tool()
+async def delete_page(page_id: str, confirm: bool = False) -> str:
+    """Permanently delete a typed page. Guarded twice: it must be called with
+    confirm=true, and it REFUSES to delete any page containing handwritten ink
+    (this server's hard rule is that the user's ink is never touched).
+
+    Args:
+        page_id: ID of the page to delete.
+        confirm: Must be true to actually delete. When false, returns the page
+            title so the caller can confirm the right page is targeted.
+
+    Returns:
+        JSON status message.
+    """
+    try:
+        meta = await make_graph_request(f"/me/onenote/pages/{page_id}")
+        title = meta.get("title") or "(untitled)"
+
+        if not confirm:
+            return json.dumps({
+                "status": "confirmation_required",
+                "page_id": page_id,
+                "title": title,
+                "message": (
+                    f"This will permanently delete '{title}'. "
+                    "Call delete_page again with confirm=true to proceed."
+                ),
+            }, indent=2)
+
+        guard = await _ink_guard(page_id, "delete it")
+        if guard:
+            return json.dumps({
+                "status": "refused",
+                "page_id": page_id,
+                "title": title,
+                "error": guard,
+            }, indent=2)
+
+        await make_graph_request(f"/me/onenote/pages/{page_id}", method="DELETE")
+        # invalidate_page walks/removes files - keep it off the event loop.
+        await asyncio.to_thread(CACHE.invalidate_page, page_id)
+        CACHE.invalidate_listings()
+
+        return json.dumps({
+            "status": "success",
+            "message": f"Page '{title}' deleted",
+            "page_id": page_id,
+        }, indent=2)
+
+    except Exception as e:
+        return f"Error deleting page: {str(e)}"
+
+@mcp.tool()
+async def check_onenote_operation(operation_id: str) -> str:
+    """Check the status of an asynchronous OneNote operation (e.g. a page copy
+    that was still pending when copy_page or move_page returned).
+
+    Args:
+        operation_id: The operation id returned by copy_page/move_page.
+
+    Returns:
+        JSON with the operation status; on completion, the new page's id.
+    """
+    try:
+        op = await make_graph_request(f"/me/onenote/operations/{operation_id}")
+        result = {
+            "operation_id": operation_id,
+            "status": op.get("status"),
+            "resource_id": op.get("resourceId"),
+            "resource_location": op.get("resourceLocation"),
+        }
+        if op.get("error"):
+            result["error"] = op["error"]
+        return json.dumps(result, indent=2)
+
+    except Exception as e:
+        return f"Error checking operation: {str(e)}"
 
 # Sidekick write-back configuration: generated summaries/todos go into a dedicated
 # section so Claude's typed output never touches the user's ink pages.
