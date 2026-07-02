@@ -1,0 +1,29 @@
+# Keep the build context small and free of anything personal/secret.
+.git
+.gitignore
+.venv
+venv
+__pycache__
+*.py[cod]
+
+# Tests & scratch
+test_*.py
+*_test.py
+dump_ink.py
+*.png
+inkml_sample.xml
+render_out.png
+
+# Local configs & secrets — must never enter an image layer
+claude_desktop_config*.json
+.env
+.env.*
+secrets/
+*.token
+*.key
+*_token_cache.json
+
+# Docs / CI (not needed at runtime)
+*.md
+.github
+docker-compose*.yml

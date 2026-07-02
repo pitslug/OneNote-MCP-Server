@@ -1,0 +1,68 @@
+# OneNote MCP Sidekick — deployment example (Traefik + GHCR).
+# Copy to your stack, fill in the placeholders, drop your secrets into ./secrets/.
+services:
+  onenote-mcp:
+    # Pull the published image (float :v1 for auto patch/minor updates), OR
+    # comment `image:` and uncomment `build:` to build locally from this folder.
+    image: ghcr.io/pitslug/onenote-mcp-server:v1
+    # build: .
+    container_name: onenote-mcp
+    restart: unless-stopped
+
+    environment:
+      # --- required ---
+      AZURE_CLIENT_ID_FILE: /run/secrets/onenote_client_id   # your own Azure app reg
+      # --- gateway auth (bearer token the MCP client sends) ---
+      ONENOTE_API_TOKEN_FILE: /run/secrets/onenote_api_token
+      # --- target notebook / write-back section ---
+      ONENOTE_SIDEKICK_NOTEBOOK: Slugbook
+      ONENOTE_SIDEKICK_SECTION: Sidekick
+      # --- transport / cache (defaults shown; override as needed) ---
+      ONENOTE_TRANSPORT: streamable-http
+      ONENOTE_HTTP_PORT: "8400"
+      ONENOTE_HTTP_PATH: /mcp
+      ONENOTE_LISTING_TTL: "60"
+      ONENOTE_INK_REVALIDATE: "30"
+      ONENOTE_CACHE_MAX_MB: "500"
+      # Optional: seed a token cache on first boot from a read-only secret.
+      # ONENOTE_TOKEN_CACHE_SEED_FILE: /run/secrets/onenote_token_seed
+
+    volumes:
+      - onenote_tokens:/data/tokens   # writable — MSAL rewrites on refresh
+      - onenote_cache:/data/cache     # notebook cache (per-page PNGs + sqlite)
+
+    secrets:
+      - onenote_client_id
+      - onenote_api_token
+      # - onenote_token_seed
+
+    networks:
+      - proxy   # your existing Traefik network
+
+    labels:
+      traefik.enable: "true"
+      # Router — adjust host + certresolver to your setup.
+      traefik.http.routers.onenote-mcp.rule: "Host(`onenote.example.com`)"
+      traefik.http.routers.onenote-mcp.entrypoints: "websecure"
+      traefik.http.routers.onenote-mcp.tls.certresolver: "letsencrypt"
+      traefik.http.services.onenote-mcp.loadbalancer.server.port: "8400"
+      # Optional edge hardening (rate-limit); the bearer token is the primary gate.
+      traefik.http.routers.onenote-mcp.middlewares: "onenote-ratelimit"
+      traefik.http.middlewares.onenote-ratelimit.ratelimit.average: "20"
+      traefik.http.middlewares.onenote-ratelimit.ratelimit.burst: "40"
+
+volumes:
+  onenote_tokens:
+  onenote_cache:
+
+secrets:
+  onenote_client_id:
+    file: ./secrets/onenote_client_id      # plain text: your Azure app (client) ID
+  onenote_api_token:
+    file: ./secrets/onenote_api_token      # plain text: a long random bearer token
+  # onenote_token_seed:
+  #   file: ./secrets/token_cache.json     # optional pre-minted MSAL cache
+
+networks:
+  proxy:
+    external: true
