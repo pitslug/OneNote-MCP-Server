@@ -25,9 +25,17 @@ anywhere.
 
 ## Tools
 
-`list_notebooks`, `list_sections`, `list_pages`, `find_pages`, `get_page_content`,
-`get_page_ink`, **`render_page_ink`** (the ink→PNG read path), `create_page`,
-`create_sidekick_page` (safe write-back), `update_page_content`, plus auth helpers.
+- **Read:** `list_notebooks`, `list_sections`, `list_section_groups`, `list_pages`,
+  `find_pages`, `get_page_content`, `get_page_ink`, **`render_page_ink`** (the
+  ink→PNG read path).
+- **Create:** `create_notebook`, `create_section`, `create_section_group`,
+  `create_section_in_group` (nested structures like *Clients > Harmony*),
+  `create_page`, `create_sidekick_page` (safe write-back), `update_page_content`.
+- **Page management:** `copy_page` (safe for ink pages — original untouched),
+  `move_page`, `delete_page`, `check_onenote_operation` (poll async Graph copies).
+  Moves and deletes are guarded: `delete_page` requires `confirm=true`, and both
+  **refuse to touch any page containing ink** — the hard rule above holds.
+- Plus auth helpers.
 
 ## Quick start
 
