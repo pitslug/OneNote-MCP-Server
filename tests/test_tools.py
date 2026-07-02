@@ -48,6 +48,27 @@ async def test_update_page_content_invalidates_caches(fresh_cache, authed, monke
     assert fresh_cache._listings == {}, "listing caches not invalidated"
 
 
+async def test_failed_update_does_not_invalidate_caches(fresh_cache, authed, monkeypatch):
+    """A rejected PATCH means the page didn't change - caches must survive."""
+    page_id = "page-43"
+
+    async def old_text():
+        return "<p>old content</p>"
+
+    await fresh_cache.page_text(page_id, "T1", old_text)
+    await fresh_cache.listing("find::25:False", 60, _const("{}"))
+
+    async def fake_patch(self, url, headers=None, json=None):
+        return FakeResponse(403, text="Forbidden")
+
+    monkeypatch.setattr(httpx.AsyncClient, "patch", fake_patch)
+
+    out = await srv.update_page_content.fn(page_id, "<p>new</p>")
+    assert "Error updating page" in out
+    assert fresh_cache._page_dir(page_id).exists()
+    assert fresh_cache._listings != {}
+
+
 def _const(value):
     async def produce():
         return value

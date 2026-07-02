@@ -73,12 +73,16 @@ async def test_mcp_with_valid_bearer_passes_through():
 class BlockingMsalApp:
     """Device flow that stays pending until release() is called."""
 
-    def __init__(self):
+    def __init__(self, initiate_delay=0.0):
         self.initiate_calls = 0
+        self._initiate_delay = initiate_delay
         self._release = threading.Event()
 
     def initiate_device_flow(self, scopes=None):
         self.initiate_calls += 1
+        if self._initiate_delay:
+            import time
+            time.sleep(self._initiate_delay)  # simulate the network round-trip
         return {"user_code": "XYZ789", "verification_uri": "https://microsoft.com/devicelogin"}
 
     def acquire_token_by_device_flow(self, flow):
@@ -115,6 +119,29 @@ async def test_auth_route_single_flight(monkeypatch):
         await asyncio.sleep(0.1)  # let the background completion task finish
 
 
+async def test_auth_route_single_flight_under_concurrent_burst(monkeypatch):
+    """Simultaneous /auth hits must not each start a device flow (TOCTOU window
+    while the first initiate is still on its network round-trip)."""
+    app = BlockingMsalApp(initiate_delay=0.1)
+
+    async def not_authed():
+        return False
+
+    monkeypatch.setattr(srv, "ensure_valid_token", not_authed)
+    monkeypatch.setattr(srv, "get_msal_app", lambda: app)
+
+    gw = Gateway(DummyInner(), token=None, auth_route=True)
+    try:
+        sends = [Collector() for _ in range(4)]
+        await asyncio.gather(*(gw(_scope("/auth"), _recv, s) for s in sends))
+        assert app.initiate_calls == 1, (
+            f"{app.initiate_calls} device flows started by a concurrent burst")
+    finally:
+        app.release()
+        for t in list(gw._auth_tasks):
+            await t
+
+
 async def test_auth_route_allows_new_flow_after_completion(monkeypatch):
     app = BlockingMsalApp()
 
@@ -127,7 +154,8 @@ async def test_auth_route_allows_new_flow_after_completion(monkeypatch):
     gw = Gateway(DummyInner(), token=None, auth_route=True)
     await gw(_scope("/auth"), _recv, Collector())
     app.release()
-    await asyncio.sleep(0.2)  # background task completes, pending flag clears
+    for t in list(gw._auth_tasks):  # deterministically wait for the completion task
+        await t
 
     again = Collector()
     await gw(_scope("/auth"), _recv, again)

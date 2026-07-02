@@ -15,6 +15,7 @@ import logging
 import html
 from email import message_from_bytes
 from email.policy import default as email_default_policy
+from urllib.parse import urlsplit
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 import time
@@ -329,7 +330,8 @@ async def check_authentication() -> str:
 
 # Shared HTTP client per event loop: connection/TLS reuse instead of a fresh client
 # per request. Keyed weakly by loop because stdio/http/one-shot entrypoints may each
-# run their own loop, and an httpx client must not cross loops.
+# run their own loop, and an httpx client must not cross loops. Clients are never
+# aclose()d explicitly: they live for the loop's lifetime and die with the process.
 import weakref
 _http_clients: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
 
@@ -420,7 +422,16 @@ async def _graph_get_all(endpoint: str, max_pages: int = 50) -> List[Dict]:
         # nextLink is absolute; re-base it since make_graph_request prefixes the host.
         if next_link.startswith(GRAPH_BASE_URL):
             next_link = next_link[len(GRAPH_BASE_URL):]
+        elif next_link.lower().startswith("http"):
+            # Defensive: host/casing variants must not get concatenated onto the base.
+            parts = urlsplit(next_link)
+            path = parts.path
+            if path.lower().startswith("/v1.0"):
+                path = path[len("/v1.0"):]
+            next_link = path + (f"?{parts.query}" if parts.query else "")
         next_endpoint = next_link
+    else:
+        logger.warning(f"_graph_get_all: hit {max_pages}-page cap on {endpoint}; result truncated")
     return items
 
 async def _graph_get_raw(path: str, params: Dict = None) -> "httpx.Response":
@@ -952,7 +963,8 @@ async def update_page_content(page_id: str, content_html: str, target_element: s
 
         # The page changed: drop its cached content/PNGs and every listing (incl. the
         # lastmod probe) so the next read sees the new content, not a stale cache.
-        CACHE.invalidate_page(page_id)
+        # invalidate_page walks/removes files - keep it off the event loop.
+        await asyncio.to_thread(CACHE.invalidate_page, page_id)
         CACHE.invalidate_listings()
 
         result = {

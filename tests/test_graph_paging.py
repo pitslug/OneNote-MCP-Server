@@ -26,6 +26,27 @@ async def test_graph_get_all_follows_next_link(monkeypatch):
     assert calls[1] == "/me/onenote/pages?$skiptoken=abc"
 
 
+async def test_graph_get_all_rebases_nonverbatim_next_link(monkeypatch):
+    """A nextLink whose host doesn't string-match GRAPH_BASE_URL must still be
+    re-based onto an endpoint path, never concatenated onto the base URL."""
+    calls = []
+
+    async def fake_request(endpoint, method="GET", data=None):
+        calls.append(endpoint)
+        if "$skiptoken" in endpoint:
+            return {"value": [{"id": "2"}]}
+        return {
+            "value": [{"id": "1"}],
+            "@odata.nextLink": "https://GRAPH.Microsoft.com/v1.0/me/onenote/pages?$skiptoken=z",
+        }
+
+    monkeypatch.setattr(srv, "make_graph_request", fake_request)
+
+    items = await srv._graph_get_all("/me/onenote/pages")
+    assert [i["id"] for i in items] == ["1", "2"]
+    assert calls[1] == "/me/onenote/pages?$skiptoken=z"
+
+
 async def test_find_pages_sees_pages_beyond_first_batch(fresh_cache, monkeypatch):
     """A section with more pages than one Graph batch must not silently truncate."""
 

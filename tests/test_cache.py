@@ -132,6 +132,38 @@ async def test_expired_listings_are_pruned(tmp_path):
     assert len(cache._listings) <= 2  # the fresh key (and at most the newest short one)
 
 
+async def test_expired_listing_locks_are_pruned_too(tmp_path):
+    """The per-listing locks must be swept along with their expired entries."""
+    cache = make_cache(tmp_path)
+
+    async def produce():
+        return "v"
+
+    for i in range(20):
+        await cache.listing(f"short:{i}", 0.01, produce)
+    await asyncio.sleep(0.05)
+    await cache.listing("fresh", 60, produce)
+
+    listing_locks = [k for k in cache._locks if k[0] == "listing"]
+    assert len(listing_locks) <= 2
+
+
+async def test_disk_write_failure_still_returns_data(tmp_path, monkeypatch):
+    """The disk tier is best-effort: a failed write must not fail the tool call."""
+    cache = make_cache(tmp_path)
+
+    def broken_write(path, data):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(cache, "_write_atomic", broken_write)
+
+    async def produce():
+        return b"FRESH"
+
+    out = await cache.ink_png("p9", 800, "T1", produce)
+    assert out == b"FRESH"
+
+
 async def test_locks_do_not_grow_per_last_mod(tmp_path):
     """Repeated renders of the same page with churning last_mod must reuse locks."""
     cache = make_cache(tmp_path)

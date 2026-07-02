@@ -166,10 +166,16 @@ class Gateway:
                                         "on the device, or retry once it expires.")
             return
 
+        # Claim the slot BEFORE the initiate network round-trip: a concurrent burst
+        # arriving during that await must not each start (and park) a device flow.
+        # Released by _complete's finally once scheduled, or the failure paths below.
+        self._auth_pending = True
+        scheduled = False
         try:
             app = srv.get_msal_app()
             flow = await asyncio.to_thread(app.initiate_device_flow, scopes=srv.SCOPES)
             if "user_code" not in flow:
+                self._auth_pending = False
                 await self._text(send, 500, "Could not start device flow.")
                 return
 
@@ -184,8 +190,8 @@ class Gateway:
                 finally:
                     self._auth_pending = False
 
-            self._auth_pending = True
             task = asyncio.ensure_future(_complete())
+            scheduled = True
             self._auth_tasks.add(task)
             task.add_done_callback(self._auth_tasks.discard)
             msg = (
@@ -195,6 +201,8 @@ class Gateway:
             )
             await self._text(send, 200, msg)
         except Exception as exc:  # noqa: BLE001
+            if not scheduled:  # once _complete owns the slot, its finally releases it
+                self._auth_pending = False
             await self._text(send, 500, f"Auth error: {exc}")
 
     @staticmethod
