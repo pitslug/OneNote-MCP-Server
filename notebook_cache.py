@@ -60,6 +60,9 @@ class NotebookCache:
         self.raster_version = raster_version or os.getenv("ONENOTE_RASTER_VERSION", "1")
 
         self._locks: Dict[Tuple, asyncio.Lock] = {}
+        # Running estimate of bytes on disk (None until first measured). Lets
+        # enforce_budget skip the full tree walk while comfortably under budget.
+        self._disk_used: Optional[int] = None
         # in-memory hot tier: key -> bytes/str ; byte-bounded LRU
         self._mem: "OrderedDict[Tuple, bytes]" = OrderedDict()
         self._mem_size = 0
@@ -122,7 +125,10 @@ class NotebookCache:
         return folder
 
     def _wipe_page(self, page_id: str) -> None:
-        shutil.rmtree(self._page_dir(page_id), ignore_errors=True)
+        folder = self._page_dir(page_id)
+        if self._disk_used is not None and folder.exists():
+            self._disk_used = max(0, self._disk_used - self._dir_size(folder))
+        shutil.rmtree(folder, ignore_errors=True)
 
     @staticmethod
     def _touch(folder: Path) -> None:
@@ -130,6 +136,26 @@ class NotebookCache:
             os.utime(folder, None)  # bump mtime for LRU
         except OSError:
             pass
+
+    # Sync bundles for the disk tier, run via asyncio.to_thread so file I/O
+    # (reads, atomic writes, budget walks) never stalls the event loop.
+    def _disk_lookup(self, page_id: str, last_mod: str, name: str) -> Optional[bytes]:
+        folder = self._page_dir(page_id)
+        meta = self._read_meta(folder)
+        fpath = folder / name
+        if meta and meta.get("last_mod") == last_mod and fpath.exists():
+            data = fpath.read_bytes()
+            self._touch(folder)
+            return data
+        return None
+
+    def _disk_store(self, page_id: str, last_mod: str, name: str, data: bytes) -> None:
+        folder = self._ensure_page_dir(page_id, last_mod)
+        self._write_atomic(folder / name, data)
+        self._touch(folder)
+        if self._disk_used is not None:
+            self._disk_used += len(data)
+        self.enforce_budget()
 
     # ---- memory tier ---------------------------------------------------
     def _mem_get(self, key: Tuple) -> Optional[bytes]:
@@ -162,21 +188,26 @@ class NotebookCache:
     def enforce_budget(self) -> None:
         if not self.enabled:
             return
+        # Fast path: the running estimate says we're under budget - skip the walk.
+        # (Estimate drifts only downward-safe: writes/wipes update it, so a full
+        # rescan happens no later than the first write after crossing the budget.)
+        if self._disk_used is not None and self._disk_used <= self.max_bytes:
+            return
         try:
             folders = [d for d in self.pages_dir.iterdir() if d.is_dir()]
         except OSError:
             return
-        total = sum(self._dir_size(d) for d in folders)
-        if total <= self.max_bytes:
-            return
-        # evict whole folders, oldest mtime first
-        for d in sorted(folders, key=lambda p: p.stat().st_mtime):
-            if total <= self.max_bytes:
-                break
-            sz = self._dir_size(d)
-            shutil.rmtree(d, ignore_errors=True)
-            total -= sz
-            logger.info("Cache eviction: dropped %s (%d bytes)", d.name, sz)
+        sizes = {d: self._dir_size(d) for d in folders}
+        total = sum(sizes.values())
+        if total > self.max_bytes:
+            # evict whole folders, oldest mtime first
+            for d in sorted(folders, key=lambda p: p.stat().st_mtime):
+                if total <= self.max_bytes:
+                    break
+                shutil.rmtree(d, ignore_errors=True)
+                total -= sizes[d]
+                logger.info("Cache eviction: dropped %s (%d bytes)", d.name, sizes[d])
+        self._disk_used = total
 
     # ---- public: ink PNG ----------------------------------------------
     async def ink_png(
@@ -191,26 +222,22 @@ class NotebookCache:
             return await produce()  # no validator -> don't cache
 
         mem_key = ("ink", page_id, last_mod, max_px, self.raster_version)
-        async with self._lock_for(mem_key):
+        # Lock key deliberately excludes last_mod: it churns on every page edit and
+        # would leak one Lock per revision. Per (page, size) still gives single-flight.
+        async with self._lock_for(("ink", page_id, max_px)):
             hit = self._mem_get(mem_key)
             if hit is not None:
                 return hit
 
-            folder = self._page_dir(page_id)
-            meta = self._read_meta(folder)
-            fpath = folder / self._ink_name(last_mod, max_px)
-            if meta and meta.get("last_mod") == last_mod and fpath.exists():
-                data = fpath.read_bytes()
-                self._touch(folder)
+            name = self._ink_name(last_mod, max_px)
+            data = await asyncio.to_thread(self._disk_lookup, page_id, last_mod, name)
+            if data is not None:
                 self._mem_put(mem_key, data)
                 return data
 
             data = await produce()
-            folder = self._ensure_page_dir(page_id, last_mod)
-            self._write_atomic(fpath, data)
-            self._touch(folder)
+            await asyncio.to_thread(self._disk_store, page_id, last_mod, name, data)
             self._mem_put(mem_key, data)
-            self.enforce_budget()
             return data
 
     # ---- public: page text --------------------------------------------
@@ -224,26 +251,19 @@ class NotebookCache:
             return await produce()
 
         mem_key = ("text", page_id, last_mod)
-        async with self._lock_for(mem_key):
+        async with self._lock_for(("text", page_id)):  # no last_mod: see ink_png
             hit = self._mem_get(mem_key)
             if hit is not None:
                 return hit.decode("utf-8")
 
-            folder = self._page_dir(page_id)
-            meta = self._read_meta(folder)
-            fpath = folder / "text.txt"
-            if meta and meta.get("last_mod") == last_mod and fpath.exists():
-                text = fpath.read_text(encoding="utf-8")
-                self._touch(folder)
-                self._mem_put(mem_key, text.encode("utf-8"))
-                return text
+            raw = await asyncio.to_thread(self._disk_lookup, page_id, last_mod, "text.txt")
+            if raw is not None:
+                self._mem_put(mem_key, raw)
+                return raw.decode("utf-8")
 
             text = await produce()
-            folder = self._ensure_page_dir(page_id, last_mod)
-            self._write_atomic(fpath, text.encode("utf-8"))
-            self._touch(folder)
+            await asyncio.to_thread(self._disk_store, page_id, last_mod, "text.txt", text.encode("utf-8"))
             self._mem_put(mem_key, text.encode("utf-8"))
-            self.enforce_budget()
             return text
 
     # ---- public: listings (TTL) ---------------------------------------
@@ -257,6 +277,10 @@ class NotebookCache:
             return await produce()
         ttl = float(os.getenv("ONENOTE_LISTING_TTL", "60")) if ttl is None else ttl
         now = time.time()
+        # Sweep expired entries so churning keys (find queries, lastmod probes)
+        # don't accumulate forever.
+        for k in [k for k, (exp, _) in self._listings.items() if exp <= now]:
+            del self._listings[k]
         cached = self._listings.get(key)
         if cached and cached[0] > now:
             return cached[1]

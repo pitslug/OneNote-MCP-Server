@@ -23,7 +23,7 @@ from msal import PublicClientApplication, SerializableTokenCache
 import httpx
 from fastmcp import FastMCP
 from fastmcp.utilities.types import Image
-from inkml_raster import rasterize_inkml
+from inkml_raster import rasterize_inkml, MIN_RENDER_PX, MAX_RENDER_PX
 from notebook_cache import CACHE
 
 # Set up logging
@@ -125,13 +125,18 @@ async def ensure_valid_token() -> bool:
     """
     global access_token, token_expires_at
 
+    # Fast path: token still comfortably valid (expiry already carries a 5-min buffer).
+    if access_token and token_expires_at and time.time() < token_expires_at:
+        return True
+
     app = get_msal_app()
     accounts = app.get_accounts()
     if not accounts:
         access_token = None
         return False
 
-    result = app.acquire_token_silent(SCOPES, account=accounts[0])
+    # MSAL is synchronous and hits the network on refresh - keep it off the event loop.
+    result = await asyncio.to_thread(app.acquire_token_silent, SCOPES, account=accounts[0])
     _persist_cache()
 
     if result and "access_token" in result:
@@ -171,9 +176,9 @@ async def start_authentication() -> str:
         # Ensure MSAL app exists (also loads any cached tokens)
         msal_app = get_msal_app()
 
-        # Start device code flow
+        # Start device code flow (network call - keep it off the event loop)
         logger.info("Initiating device flow for authentication...")
-        flow = msal_app.initiate_device_flow(scopes=SCOPES)
+        flow = await asyncio.to_thread(msal_app.initiate_device_flow, scopes=SCOPES)
         
         if "user_code" not in flow:
             error_msg = flow.get('error_description', 'Unknown error in device flow')
@@ -225,9 +230,11 @@ async def complete_authentication() -> str:
             }, indent=2)
         
         logger.info("Completing device flow authentication...")
-        
-        # Complete the flow
-        result = msal_app.acquire_token_by_device_flow(current_flow)
+
+        # Complete the flow. This POLLS until the user finishes sign-in (up to the
+        # flow's expiry, ~15 min) - run it on a worker thread or it freezes every
+        # concurrent request of the HTTP server, health checks included.
+        result = await asyncio.to_thread(msal_app.acquire_token_by_device_flow, current_flow)
 
         if "access_token" in result:
             # MSAL populated the token cache (incl. the refresh token); persist it.
@@ -320,6 +327,20 @@ async def check_authentication() -> str:
             "token_caching": "unknown"
         }, indent=2)
 
+# Shared HTTP client per event loop: connection/TLS reuse instead of a fresh client
+# per request. Keyed weakly by loop because stdio/http/one-shot entrypoints may each
+# run their own loop, and an httpx client must not cross loops.
+import weakref
+_http_clients: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+
+def _http_client() -> httpx.AsyncClient:
+    loop = asyncio.get_running_loop()
+    client = _http_clients.get(loop)
+    if client is None or client.is_closed:
+        client = httpx.AsyncClient(timeout=GRAPH_TIMEOUT)
+        _http_clients[loop] = client
+    return client
+
 # HTTP statuses worth retrying - OneNote/Graph are prone to transient 429/503/504.
 RETRY_STATUSES = {429, 503, 504}
 MAX_RETRIES = int(os.getenv("ONENOTE_MAX_RETRIES", "4"))
@@ -353,15 +374,15 @@ async def make_graph_request(endpoint: str, method: str = "GET", data: Dict = No
     response = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            async with httpx.AsyncClient(timeout=GRAPH_TIMEOUT) as client:
-                if method == "GET":
-                    response = await client.get(url, headers=headers)
-                elif method == "POST":
-                    response = await client.post(url, headers=headers, json=data)
-                elif method == "PATCH":
-                    response = await client.patch(url, headers=headers, json=data)
-                else:
-                    raise ValueError(f"Unsupported HTTP method: {method}")
+            client = _http_client()
+            if method == "GET":
+                response = await client.get(url, headers=headers)
+            elif method == "POST":
+                response = await client.post(url, headers=headers, json=data)
+            elif method == "PATCH":
+                response = await client.patch(url, headers=headers, json=data)
+            else:
+                raise ValueError(f"Unsupported HTTP method: {method}")
         except httpx.TransportError as e:
             last_error = f"network error: {e}"
             if attempt < MAX_RETRIES:
@@ -382,6 +403,26 @@ async def make_graph_request(endpoint: str, method: str = "GET", data: Dict = No
 
     raise Exception(f"Graph API error after {MAX_RETRIES} attempts on {endpoint} - {last_error or 'transient failures'}")
 
+async def _graph_get_all(endpoint: str, max_pages: int = 50) -> List[Dict]:
+    """GET a Graph collection endpoint, following @odata.nextLink pagination.
+
+    Graph caps each response batch (default 20 for OneNote collections); without
+    following nextLink, anything past the first batch is silently dropped.
+    """
+    items: List[Dict] = []
+    next_endpoint = endpoint
+    for _ in range(max_pages):
+        resp = await make_graph_request(next_endpoint)
+        items.extend(resp.get("value", []))
+        next_link = resp.get("@odata.nextLink")
+        if not next_link:
+            break
+        # nextLink is absolute; re-base it since make_graph_request prefixes the host.
+        if next_link.startswith(GRAPH_BASE_URL):
+            next_link = next_link[len(GRAPH_BASE_URL):]
+        next_endpoint = next_link
+    return items
+
 async def _graph_get_raw(path: str, params: Dict = None) -> "httpx.Response":
     """Raw Graph GET returning the untouched httpx.Response (for multipart/HTML page
     bodies), with the same transient-retry behavior as make_graph_request."""
@@ -393,8 +434,7 @@ async def _graph_get_raw(path: str, params: Dict = None) -> "httpx.Response":
     response = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            async with httpx.AsyncClient(timeout=GRAPH_TIMEOUT) as client:
-                response = await client.get(url, headers=headers, params=params)
+            response = await _http_client().get(url, headers=headers, params=params)
         except httpx.TransportError as e:
             last_error = f"network error: {e}"
             if attempt < MAX_RETRIES:
@@ -439,11 +479,11 @@ async def list_notebooks() -> str:
     """
     try:
         logger.info("Making request to /me/onenote/notebooks")
-        notebooks = await make_graph_request("/me/onenote/notebooks")
-        logger.info(f"Graph API response received with {len(notebooks.get('value', []))} notebooks")
-        
+        notebooks = await _graph_get_all("/me/onenote/notebooks")
+        logger.info(f"Graph API response received with {len(notebooks)} notebooks")
+
         result = []
-        for notebook in notebooks.get("value", []):
+        for notebook in notebooks:
             result.append({
                 "id": notebook.get("id"),
                 "name": notebook.get("displayName"),
@@ -470,10 +510,10 @@ async def list_sections(notebook_id: str) -> str:
         JSON string containing section information
     """
     try:
-        sections = await make_graph_request(f"/me/onenote/notebooks/{notebook_id}/sections")
-        
+        sections = await _graph_get_all(f"/me/onenote/notebooks/{notebook_id}/sections")
+
         result = []
-        for section in sections.get("value", []):
+        for section in sections:
             result.append({
                 "id": section.get("id"),
                 "name": section.get("displayName"),
@@ -498,10 +538,10 @@ async def list_pages(section_id: str) -> str:
         JSON string containing page information
     """
     try:
-        pages = await make_graph_request(f"/me/onenote/sections/{section_id}/pages")
-        
+        pages = await _graph_get_all(f"/me/onenote/sections/{section_id}/pages")
+
         result = []
-        for page in pages.get("value", []):
+        for page in pages:
             result.append({
                 "id": page.get("id"),
                 "title": page.get("title"),
@@ -650,6 +690,8 @@ async def render_page_ink(page_id: str, max_px: int = 1200) -> Image:
     Returns:
         A PNG image of the page's ink.
     """
+    # Clamp here too (not just in the rasterizer) so cache keys stay bounded.
+    max_px = max(MIN_RENDER_PX, min(int(max_px), MAX_RENDER_PX))
     last_mod = await _page_last_mod(page_id)
 
     async def _produce() -> bytes:
@@ -816,22 +858,21 @@ async def _create_page_impl(section_id: str, title: str, content_html: str = Non
 
         # OneNote API expects multipart form data for page creation
         token = await get_access_token()
-        async with httpx.AsyncClient(timeout=GRAPH_TIMEOUT) as client:
-            headers = {
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/xhtml+xml"
-            }
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/xhtml+xml"
+        }
 
-            response = await client.post(
-                f"{GRAPH_BASE_URL}/me/onenote/sections/{section_id}/pages",
-                headers=headers,
-                content=page_html
-            )
+        response = await _http_client().post(
+            f"{GRAPH_BASE_URL}/me/onenote/sections/{section_id}/pages",
+            headers=headers,
+            content=page_html
+        )
 
-            if response.status_code >= 400:
-                return f"Error creating page: {response.status_code} - {response.text}"
+        if response.status_code >= 400:
+            return f"Error creating page: {response.status_code} - {response.text}"
 
-            page = response.json()
+        page = response.json()
 
         links = page.get("links") or {}
         result = {
@@ -895,20 +936,24 @@ async def update_page_content(page_id: str, content_html: str, target_element: s
         ]
 
         token = await get_access_token()
-        async with httpx.AsyncClient(timeout=GRAPH_TIMEOUT) as client:
-            headers = {
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json"
-            }
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
 
-            response = await client.patch(
-                f"{GRAPH_BASE_URL}/me/onenote/pages/{page_id}/content",
-                headers=headers,
-                json=patch_data
-            )
+        response = await _http_client().patch(
+            f"{GRAPH_BASE_URL}/me/onenote/pages/{page_id}/content",
+            headers=headers,
+            json=patch_data
+        )
 
-            if response.status_code >= 400:
-                return f"Error updating page: {response.status_code} - {response.text}"
+        if response.status_code >= 400:
+            return f"Error updating page: {response.status_code} - {response.text}"
+
+        # The page changed: drop its cached content/PNGs and every listing (incl. the
+        # lastmod probe) so the next read sees the new content, not a stale cache.
+        CACHE.invalidate_page(page_id)
+        CACHE.invalidate_listings()
 
         result = {
             "status": "success",
@@ -927,7 +972,7 @@ SIDEKICK_NOTEBOOK = os.getenv("ONENOTE_SIDEKICK_NOTEBOOK", "Slugbook")
 SIDEKICK_SECTION = os.getenv("ONENOTE_SIDEKICK_SECTION", "Sidekick")
 
 async def _find_notebook_id(name: str) -> Optional[str]:
-    notebooks = (await make_graph_request("/me/onenote/notebooks")).get("value", [])
+    notebooks = await _graph_get_all("/me/onenote/notebooks")
     for nb in notebooks:
         if nb.get("displayName") == name:
             return nb.get("id")
@@ -938,7 +983,7 @@ async def _find_or_create_sidekick_section() -> str:
     nb_id = await _find_notebook_id(SIDEKICK_NOTEBOOK)
     if not nb_id:
         raise Exception(f"Sidekick notebook '{SIDEKICK_NOTEBOOK}' not found.")
-    sections = (await make_graph_request(f"/me/onenote/notebooks/{nb_id}/sections")).get("value", [])
+    sections = await _graph_get_all(f"/me/onenote/notebooks/{nb_id}/sections")
     for s in sections:
         if s.get("displayName") == SIDEKICK_SECTION:
             return s.get("id")
@@ -986,14 +1031,16 @@ def _html_to_text(html_str: str, limit: int = 160) -> str:
 
 async def _find_pages_impl(query: str = "", limit: int = 25, include_preview: bool = False) -> str:
     """List pages in the working notebook with dates, section, ink flag and a typed-text
-    preview, most-recently-modified first, with an optional title substring filter."""
+    preview, most-recently-modified first, with an optional title substring filter.
+
+    Raises on failure (e.g. notebook missing) so errors are never cached as listings."""
     nb_id = await _find_notebook_id(SIDEKICK_NOTEBOOK)
     if not nb_id:
-        return json.dumps({"status": "error", "error": f"Notebook '{SIDEKICK_NOTEBOOK}' not found."}, indent=2)
-    sections = (await make_graph_request(f"/me/onenote/notebooks/{nb_id}/sections")).get("value", [])
+        raise Exception(f"Notebook '{SIDEKICK_NOTEBOOK}' not found.")
+    sections = await _graph_get_all(f"/me/onenote/notebooks/{nb_id}/sections")
     pages = []
     for s in sections:
-        sp = (await make_graph_request(f"/me/onenote/sections/{s['id']}/pages?$top=100")).get("value", [])
+        sp = await _graph_get_all(f"/me/onenote/sections/{s['id']}/pages?$top=100")
         for p in sp:
             plinks = p.get("links") or {}
             pages.append({
@@ -1012,19 +1059,26 @@ async def _find_pages_impl(query: str = "", limit: int = 25, include_preview: bo
     pages = pages[:max(1, limit)]
 
     if include_preview:
-        for p in pages:
-            try:
-                r = await _graph_get_raw(
-                    f"/me/onenote/pages/{p['id']}/content", params={"includeInkML": "true"})
-                if r.status_code < 400:
-                    parsed = _parse_page_multipart(r.headers.get("content-type", ""), r.content)
-                    p["has_ink"] = parsed["has_ink"]
-                    p["ink_traces"] = parsed["trace_count"]
-                    p["preview"] = _html_to_text(parsed["html"])
-                else:
-                    p["preview_error"] = str(r.status_code)
-            except Exception as e:
-                p["preview_error"] = str(e)
+        # One content fetch per page: run them concurrently, bounded so a large
+        # listing doesn't hammer Graph (throttling) or the event loop.
+        sem = asyncio.Semaphore(5)
+
+        async def _fill_preview(p: Dict) -> None:
+            async with sem:
+                try:
+                    r = await _graph_get_raw(
+                        f"/me/onenote/pages/{p['id']}/content", params={"includeInkML": "true"})
+                    if r.status_code < 400:
+                        parsed = _parse_page_multipart(r.headers.get("content-type", ""), r.content)
+                        p["has_ink"] = parsed["has_ink"]
+                        p["ink_traces"] = parsed["trace_count"]
+                        p["preview"] = _html_to_text(parsed["html"])
+                    else:
+                        p["preview_error"] = str(r.status_code)
+                except Exception as e:
+                    p["preview_error"] = str(e)
+
+        await asyncio.gather(*(_fill_preview(p) for p in pages))
 
     return json.dumps(
         {"status": "success", "notebook": SIDEKICK_NOTEBOOK, "count": len(pages), "pages": pages},
@@ -1052,9 +1106,13 @@ async def find_pages(query: str = "", limit: int = 25, include_preview: bool = F
         JSON list of pages with metadata (and preview/ink info if requested).
     """
     key = f"find:{query}:{limit}:{include_preview}"
-    return await CACHE.listing(
-        key, None, lambda: _find_pages_impl(query=query, limit=limit, include_preview=include_preview)
-    )
+    try:
+        return await CACHE.listing(
+            key, None, lambda: _find_pages_impl(query=query, limit=limit, include_preview=include_preview)
+        )
+    except Exception as e:
+        # Errors propagate as exceptions so they are never cached for the TTL.
+        return json.dumps({"status": "error", "error": str(e)}, indent=2)
 
 def main():
     """Main entry point for the server."""

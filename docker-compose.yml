@@ -29,7 +29,7 @@ services:
 
     volumes:
       - onenote_tokens:/data/tokens   # writable — MSAL rewrites on refresh
-      - onenote_cache:/data/cache     # notebook cache (per-page PNGs + sqlite)
+      - onenote_cache:/data/cache     # notebook cache (per-page PNGs + text)
 
     secrets:
       - onenote_client_id
