@@ -59,8 +59,11 @@ Or pull the published image: `ghcr.io/pitslug/onenote-mcp-server:1`.
 
 ## Auth model (two independent layers)
 
-- **Gateway** — a bearer token gates the MCP endpoint (for the machine client). Keep any
-  interactive SSO (e.g. Pocket-ID) for human-facing routes only.
+- **Gateway** — a bearer token gates the MCP endpoint (for machine clients like Claude
+  Code). Optionally, set the `ONENOTE_OIDC_*` vars to also serve spec OAuth via an OIDC
+  proxy in front of your identity provider (e.g. Pocket-ID) — this is what claude.ai
+  custom connectors require, since they can't send static headers. Both credentials work
+  side-by-side; see [DEPLOY.md](./DEPLOY.md) for the connector walkthrough.
 - **Microsoft/OneNote** — MSAL device-code sign-in once; the refresh token
   (`offline_access`) is cached to a mounted volume and refreshed silently thereafter.
 

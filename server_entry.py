@@ -43,6 +43,71 @@ except Exception:  # authlib absent or relocated — leave default warnings beha
 # 1) Secrets must resolve before onenote_mcp_server reads AZURE_CLIENT_ID etc.
 load_file_backed_env()
 
+# Import AFTER the authlib warning filter above.
+from fastmcp.server.auth import AccessToken  # noqa: E402
+from fastmcp.server.auth.oidc_proxy import OIDCProxy  # noqa: E402
+
+
+def _static_access_token(token: str, static_token: str | None) -> AccessToken | None:
+    """AccessToken for the static ONENOTE_API_TOKEN bearer, else None."""
+    if not token or not static_token:
+        return None
+    if hmac.compare_digest(token, static_token):
+        return AccessToken(token=token, client_id="onenote-static-bearer",
+                           scopes=[], expires_at=None)
+    return None
+
+
+class DualAuthOIDCProxy(OIDCProxy):
+    """OIDC proxy that ALSO accepts the static ONENOTE_API_TOKEN bearer.
+
+    claude.ai custom connectors only speak spec OAuth (authorization code + PKCE
+    with dynamic client registration) - no static headers. Pocket-ID has no DCR,
+    so the proxy fronts it and presents DCR to clients. Existing Claude Code
+    clients keep sending the static bearer; it's accepted here before falling
+    back to normal OAuth token verification.
+    """
+
+    def __init__(self, *, static_token: str | None = None, **kwargs):
+        super().__init__(**kwargs)
+        self._static_token = static_token or None
+
+    async def load_access_token(self, token: str):
+        static = _static_access_token(token, self._static_token)
+        if static is not None:
+            return static
+        return await super().load_access_token(token)
+
+
+def _build_auth_provider(static_token: str | None):
+    """DualAuthOIDCProxy from ONENOTE_OIDC_* env, or None when not configured.
+
+    Presence of ONENOTE_OIDC_CONFIG_URL turns connector OAuth on; a partial
+    config raises instead of booting with the endpoint ungated.
+    """
+    config_url = (os.getenv("ONENOTE_OIDC_CONFIG_URL") or "").strip()
+    if not config_url:
+        return None
+    client_id = (os.getenv("ONENOTE_OIDC_CLIENT_ID") or "").strip()
+    client_secret = (os.getenv("ONENOTE_OIDC_CLIENT_SECRET") or "").strip()
+    base_url = (os.getenv("ONENOTE_PUBLIC_BASE_URL") or "").strip()
+    missing = [name for name, value in (
+        ("ONENOTE_OIDC_CLIENT_ID", client_id),
+        ("ONENOTE_OIDC_CLIENT_SECRET", client_secret),
+        ("ONENOTE_PUBLIC_BASE_URL", base_url),
+    ) if not value]
+    if missing:
+        raise RuntimeError(
+            "ONENOTE_OIDC_CONFIG_URL is set but connector OAuth is incomplete; "
+            "missing: " + ", ".join(missing))
+    return DualAuthOIDCProxy(
+        config_url=config_url,
+        client_id=client_id,
+        client_secret=client_secret,
+        base_url=base_url,
+        static_token=static_token,
+    )
+
 
 def _seed_token_cache() -> None:
     """Copy a read-only seed cache into the writable working path on first run.
@@ -231,17 +296,36 @@ def _log_auth_status() -> None:
 
 
 def build_http_app():
-    """Return the bearer-gated ASGI app around the MCP streamable-HTTP endpoint."""
+    """Return the gated ASGI app around the MCP streamable-HTTP endpoint.
+
+    Two auth modes:
+    * default: static bearer gate in the Gateway (ONENOTE_API_TOKEN).
+    * ONENOTE_OIDC_* set: FastMCP OAuth (OIDC proxy, for claude.ai custom
+      connectors). The Gateway's gate is disabled so the OAuth/.well-known
+      routes stay reachable; the MCP endpoint itself is then enforced by
+      FastMCP's auth middleware, where the static token remains valid via
+      DualAuthOIDCProxy (Claude Code keeps working unchanged).
+    """
     import onenote_mcp_server as srv
 
     mount_path = os.getenv("ONENOTE_HTTP_PATH", "/mcp")
-    inner = srv.mcp.http_app(path=mount_path)  # Starlette app w/ session-manager lifespan
     token = (os.getenv("ONENOTE_API_TOKEN") or "").strip()
+    auth_provider = _build_auth_provider(token or None)
+    srv.mcp.auth = auth_provider  # None -> plain app, exactly the old behavior
+    inner = srv.mcp.http_app(path=mount_path)  # Starlette app w/ session-manager lifespan
     auth_route = (os.getenv("ONENOTE_ENABLE_AUTH_ROUTE", "true").lower() in ("1", "true", "yes"))
-    if not token:
-        logger.warning("ONENOTE_API_TOKEN not set - MCP endpoint is UNGATED at the app "
-                       "layer (rely on Traefik/network). Set it for defense in depth.")
-    return Gateway(inner, token, auth_route), inner
+
+    if auth_provider is not None:
+        logger.info("Connector OAuth enabled (OIDC proxy at %s); static bearer "
+                    "still accepted for existing clients.",
+                    os.getenv("ONENOTE_OIDC_CONFIG_URL"))
+        gate_token = None  # FastMCP auth middleware enforces from here on
+    else:
+        gate_token = token
+        if not gate_token:
+            logger.warning("ONENOTE_API_TOKEN not set - MCP endpoint is UNGATED at the app "
+                           "layer (rely on Traefik/network). Set it for defense in depth.")
+    return Gateway(inner, gate_token, auth_route), inner
 
 
 def run_http() -> int:
