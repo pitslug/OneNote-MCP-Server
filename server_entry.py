@@ -48,13 +48,18 @@ from fastmcp.server.auth import AccessToken  # noqa: E402
 from fastmcp.server.auth.oidc_proxy import OIDCProxy  # noqa: E402
 
 
-def _static_access_token(token: str, static_token: str | None) -> AccessToken | None:
-    """AccessToken for the static ONENOTE_API_TOKEN bearer, else None."""
+def _static_access_token(token: str, static_token: str | None,
+                         scopes: list | None = None) -> AccessToken | None:
+    """AccessToken for the static ONENOTE_API_TOKEN bearer, else None.
+
+    scopes should mirror the provider's required_scopes so the scope-enforcement
+    middleware accepts the static bearer alongside OAuth tokens.
+    """
     if not token or not static_token:
         return None
     if hmac.compare_digest(token, static_token):
         return AccessToken(token=token, client_id="onenote-static-bearer",
-                           scopes=[], expires_at=None)
+                           scopes=list(scopes or []), expires_at=None)
     return None
 
 
@@ -73,7 +78,8 @@ class DualAuthOIDCProxy(OIDCProxy):
         self._static_token = static_token or None
 
     async def load_access_token(self, token: str):
-        static = _static_access_token(token, self._static_token)
+        static = _static_access_token(token, self._static_token,
+                                      scopes=self.required_scopes)
         if static is not None:
             return static
         return await super().load_access_token(token)
@@ -100,12 +106,17 @@ def _build_auth_provider(static_token: str | None):
         raise RuntimeError(
             "ONENOTE_OIDC_CONFIG_URL is set but connector OAuth is incomplete; "
             "missing: " + ", ".join(missing))
+    # Scopes requested from the IdP (advertised to clients via .well-known and
+    # forwarded upstream). Pocket-ID rejects an authorize request without any
+    # scope ("Scope is required"), so this must never be empty.
+    scopes = (os.getenv("ONENOTE_OIDC_SCOPES") or "openid profile email").replace(",", " ").split()
     return DualAuthOIDCProxy(
         config_url=config_url,
         client_id=client_id,
         client_secret=client_secret,
         base_url=base_url,
         static_token=static_token,
+        required_scopes=scopes,
     )
 
 
