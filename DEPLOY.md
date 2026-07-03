@@ -138,8 +138,14 @@ Leave the OAuth client ID/secret fields empty (dynamic registration handles it).
 You'll be redirected to Pocket-ID to sign in, then back to Claude.
 
 Notes:
-- Dynamically-registered clients and issued tokens are held in memory: after a
-  container restart, claude.ai silently re-registers/re-authorizes on next use.
+- OAuth proxy state (dynamic client registrations) is persisted under `FASTMCP_HOME`
+  — the image (>= 1.1.1) sets it to `/data/tokens/fastmcp` on the tokens volume, so
+  connections survive container restarts. On the 1.1.0 image, set
+  `FASTMCP_HOME: /data/tokens/fastmcp` in your compose environment yourself (the
+  library default is `$HOME/.local/share/fastmcp`, which is unwritable when running
+  with a `user:` override and crashes at boot).
+- Token signing is derived from the OIDC client secret: rotating the secret in
+  Pocket-ID invalidates issued tokens; claude.ai just re-authorizes on next use.
 - The Microsoft/Graph sign-in (device flow, token volume) is unchanged and stays
   server-side — connector OAuth only controls who may reach the MCP endpoint.
 

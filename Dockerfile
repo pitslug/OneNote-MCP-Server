@@ -8,7 +8,8 @@ ENV PYTHONUNBUFFERED=1 \
     ONENOTE_HTTP_HOST=0.0.0.0 \
     ONENOTE_HTTP_PORT=8400 \
     ONENOTE_TOKEN_CACHE=/data/tokens/token_cache.json \
-    ONENOTE_DATA_CACHE=/data/cache
+    ONENOTE_DATA_CACHE=/data/cache \
+    FASTMCP_HOME=/data/tokens/fastmcp
 
 WORKDIR /app
 
