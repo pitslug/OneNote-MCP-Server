@@ -104,6 +104,45 @@ patch/minor releases automatically; pin `:1.0.0` if you'd rather bump by hand.
 
 ---
 
+## Claude Chat (claude.ai) custom connector — OAuth via Pocket-ID
+
+claude.ai custom connectors can't send a static bearer header — they require spec
+OAuth (authorization code + PKCE, with dynamic client registration). When the
+`ONENOTE_OIDC_*` vars below are set, the server fronts your Pocket-ID with FastMCP's
+OIDC proxy: claude.ai registers itself dynamically with the server, and the actual
+sign-in happens at Pocket-ID with your passkey. The static bearer token keeps working
+side-by-side, so Claude Code connectors need no changes.
+
+### 1. Register a client in Pocket-ID
+- Name: anything (e.g. `onenote-mcp`)
+- Callback URL: `https://onenote.slugworx.net/auth/callback` (the **MCP server's**
+  public host — FastMCP's fixed upstream callback), not claude.ai.
+- Confidential client; note the client ID and secret.
+
+### 2. Add the env/secrets to compose
+```yaml
+environment:
+  ONENOTE_OIDC_CONFIG_URL: "https://id.slugworx.net/.well-known/openid-configuration"
+  ONENOTE_OIDC_CLIENT_ID: "<pocket-id client id>"
+  ONENOTE_OIDC_CLIENT_SECRET_FILE: /run/secrets/onenote_oidc_client_secret
+  ONENOTE_PUBLIC_BASE_URL: "https://onenote.slugworx.net"
+```
+Presence of `ONENOTE_OIDC_CONFIG_URL` switches connector OAuth on; a partial config
+refuses to boot rather than serving the endpoint ungated. With OAuth on, the app-layer
+gate moves from the Gateway into FastMCP's auth middleware (the `.well-known` and
+OAuth routes must be publicly reachable — Traefik needs no per-path auth rules).
+
+### 3. Add the connector in claude.ai
+Settings → Connectors → Add custom connector → URL `https://onenote.slugworx.net/mcp`.
+Leave the OAuth client ID/secret fields empty (dynamic registration handles it).
+You'll be redirected to Pocket-ID to sign in, then back to Claude.
+
+Notes:
+- Dynamically-registered clients and issued tokens are held in memory: after a
+  container restart, claude.ai silently re-registers/re-authorizes on next use.
+- The Microsoft/Graph sign-in (device flow, token volume) is unchanged and stays
+  server-side — connector OAuth only controls who may reach the MCP endpoint.
+
 ## Re-auth / rotate later
 - **New bearer token:** overwrite `secrets/onenote_api_token`, `docker compose up -d`,
   update the connector header.
