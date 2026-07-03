@@ -73,9 +73,26 @@ class DualAuthOIDCProxy(OIDCProxy):
     back to normal OAuth token verification.
     """
 
-    def __init__(self, *, static_token: str | None = None, **kwargs):
+    def __init__(self, *, static_token: str | None = None,
+                 request_scopes: list | None = None, **kwargs):
         super().__init__(**kwargs)
         self._static_token = static_token or None
+        if request_scopes:
+            self._apply_request_scopes(request_scopes)
+
+    def _apply_request_scopes(self, scopes: list) -> None:
+        """Advertise the scopes (metadata) and forward them upstream, WITHOUT
+        making them required on tokens.
+
+        Pocket-ID rejects an authorize request with no scope ("Scope is
+        required"), so clients must be told to ask for these. But Pocket-ID
+        access tokens carry no scope claim, so passing these as required_scopes
+        would 401 every request - in the upstream token verifier and again in
+        RequireAuthMiddleware.
+        """
+        self._default_scope_str = " ".join(scopes)
+        if self.client_registration_options is not None:
+            self.client_registration_options.valid_scopes = list(scopes)
 
     async def load_access_token(self, token: str):
         static = _static_access_token(token, self._static_token,
@@ -108,7 +125,8 @@ def _build_auth_provider(static_token: str | None):
             "missing: " + ", ".join(missing))
     # Scopes requested from the IdP (advertised to clients via .well-known and
     # forwarded upstream). Pocket-ID rejects an authorize request without any
-    # scope ("Scope is required"), so this must never be empty.
+    # scope ("Scope is required"), so this must never be empty. Deliberately NOT
+    # required_scopes - see DualAuthOIDCProxy._apply_request_scopes.
     scopes = (os.getenv("ONENOTE_OIDC_SCOPES") or "openid profile email").replace(",", " ").split()
     return DualAuthOIDCProxy(
         config_url=config_url,
@@ -116,7 +134,7 @@ def _build_auth_provider(static_token: str | None):
         client_secret=client_secret,
         base_url=base_url,
         static_token=static_token,
-        required_scopes=scopes,
+        request_scopes=scopes,
     )
 
 

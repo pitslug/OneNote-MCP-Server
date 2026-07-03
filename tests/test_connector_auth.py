@@ -101,8 +101,10 @@ def test_build_http_app_with_oidc_moves_gate_inward(monkeypatch, restore_mcp_aut
     assert captured["base_url"] == "https://mcp.example.net"
     assert captured["static_token"] == "sekrit"
     # Pocket-ID rejects an authorize request without scopes ("Scope is required"),
-    # so the proxy must declare them (advertised via .well-known and forwarded).
-    assert captured["required_scopes"] == ["openid", "profile", "email"]
+    # so the proxy must advertise/request them - but NEVER require them: Pocket-ID
+    # access tokens carry no scope claim, so required_scopes would 401 every call.
+    assert captured["request_scopes"] == ["openid", "profile", "email"]
+    assert "required_scopes" not in captured
 
 
 def test_build_http_app_oidc_scopes_overridable(monkeypatch, restore_mcp_auth):
@@ -124,7 +126,24 @@ def test_build_http_app_oidc_scopes_overridable(monkeypatch, restore_mcp_auth):
     monkeypatch.setenv("ONENOTE_OIDC_SCOPES", "openid groups")
 
     build_http_app()
-    assert captured["required_scopes"] == ["openid", "groups"]
+    assert captured["request_scopes"] == ["openid", "groups"]
+
+
+def test_apply_request_scopes_advertises_without_requiring():
+    """Scopes must reach the DCR default + .well-known metadata, but never
+    become a token requirement (Pocket-ID access tokens carry no scope claim)."""
+    from mcp.server.auth.settings import ClientRegistrationOptions
+
+    proxy = DualAuthOIDCProxy.__new__(DualAuthOIDCProxy)  # skip network-touching init
+    proxy.required_scopes = None
+    proxy._default_scope_str = ""
+    proxy.client_registration_options = ClientRegistrationOptions(enabled=True)
+
+    proxy._apply_request_scopes(["openid", "profile", "email"])
+
+    assert proxy._default_scope_str == "openid profile email"
+    assert proxy.client_registration_options.valid_scopes == ["openid", "profile", "email"]
+    assert not proxy.required_scopes, "request scopes must not become required scopes"
 
 
 def test_build_http_app_half_configured_oidc_refuses_to_boot(monkeypatch, restore_mcp_auth):
